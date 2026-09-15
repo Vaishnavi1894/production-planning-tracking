@@ -6,126 +6,382 @@ import com.production.model.ProductionPlan;
 import com.production.model.VarianceReportItem;
 import jakarta.inject.Singleton;
 
+import java.sql.*;
 import java.time.LocalDate;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * In-memory DataStore acting as our database repository.
- * Preloaded with realistic manufacturing sample data so the system works out-of-the-box.
- * Thread-safe collections ensure safe concurrent reads and writes.
+ * DataStore Repository connecting directly to MySQL Database (production_db).
+ * Also integrates ConcurrentHashMap as a high-speed, thread-safe in-memory cache!
+ * 
+ * Key Highlights:
+ * 1. MySQL Database: Persistent storage of products, plans, and daily logs.
+ * 2. ConcurrentHashMap: Thread-safe in-memory cache for O(1) lookups and concurrent reads.
+ * 3. Graceful Fallback: Seamlessly falls back to in-memory ConcurrentHashMap if MySQL is temporarily offline.
  */
 @Singleton
 public class DataStore {
 
-    private final List<Product> products = new CopyOnWriteArrayList<>();
-    private final List<ProductionPlan> plans = new CopyOnWriteArrayList<>();
-    private final List<ProductionEntry> entries = new CopyOnWriteArrayList<>();
+    private static final String DB_URL = "jdbc:mysql://localhost:3306/production_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC";
+    private static final String DB_USER = "root";
+    private static final String DB_PASS = "root";
 
-    private final AtomicLong productIdSeq = new AtomicLong(1);
-    private final AtomicLong planIdSeq = new AtomicLong(1);
-    private final AtomicLong entryIdSeq = new AtomicLong(1);
+    // ConcurrentHashMap used as a high-speed, thread-safe cache
+    private final Map<Long, Product> productCache = new ConcurrentHashMap<>();
+    private final Map<Long, ProductionPlan> planCache = new ConcurrentHashMap<>();
+    private final Map<Long, ProductionEntry> entryCache = new ConcurrentHashMap<>();
+
+    private final AtomicLong fallbackIdSeq = new AtomicLong(100);
+    private boolean mysqlConnected = false;
 
     public DataStore() {
-        seedSampleData();
+        initDatabase();
     }
 
     /**
-     * Seeds initial realistic manufacturing data.
+     * Initializes MySQL database connection and creates tables if they do not exist.
      */
-    private void seedSampleData() {
-        // 1. Initial Products
-        Product p1 = addProduct(new Product(null, "PRD-001", "Alloy Wheel 17-inch", "Casting", "Units", "High-strength aluminum alloy wheels"));
-        Product p2 = addProduct(new Product(null, "PRD-002", "Engine Cylinder Block", "Machining", "Units", "Precision-bored 4-cylinder engine blocks"));
-        Product p3 = addProduct(new Product(null, "PRD-003", "Brake Rotor Disc", "Fabrication", "Units", "Ventilated front rotor discs"));
-        Product p4 = addProduct(new Product(null, "PRD-004", "Steering Gearbox", "Assembly", "Sets", "Hydraulic power steering rack"));
+    private void initDatabase() {
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+             Statement stmt = conn.createStatement()) {
 
-        String currentMonth = LocalDate.now().getYear() + "-" + String.format("%02d", LocalDate.now().getMonthValue());
+            stmt.execute("CREATE TABLE IF NOT EXISTS products (" +
+                    "id BIGINT AUTO_INCREMENT PRIMARY KEY, " +
+                    "product_code VARCHAR(50) NOT NULL, " +
+                    "product_name VARCHAR(255) NOT NULL, " +
+                    "category VARCHAR(100) NOT NULL, " +
+                    "unit_of_measure VARCHAR(50) NOT NULL, " +
+                    "description TEXT)");
 
-        // 2. Initial Production Plans
-        addPlan(new ProductionPlan(null, p1.getId(), p1.getProductName(), currentMonth, 500, "Regular monthly target"));
-        addPlan(new ProductionPlan(null, p2.getId(), p2.getProductName(), currentMonth, 300, "Export order batch"));
-        addPlan(new ProductionPlan(null, p3.getId(), p3.getProductName(), currentMonth, 400, "OEM supply target"));
-        addPlan(new ProductionPlan(null, p4.getId(), p4.getProductName(), currentMonth, 250, "Assembly line requirement"));
+            stmt.execute("CREATE TABLE IF NOT EXISTS production_plans (" +
+                    "id BIGINT AUTO_INCREMENT PRIMARY KEY, " +
+                    "product_id BIGINT NOT NULL, " +
+                    "product_name VARCHAR(255), " +
+                    "plan_month VARCHAR(20) NOT NULL, " +
+                    "planned_quantity DOUBLE NOT NULL, " +
+                    "notes TEXT)");
 
-        String today = LocalDate.now().toString();
-        String yesterday = LocalDate.now().minusDays(1).toString();
+            stmt.execute("CREATE TABLE IF NOT EXISTS production_entries (" +
+                    "id BIGINT AUTO_INCREMENT PRIMARY KEY, " +
+                    "product_id BIGINT NOT NULL, " +
+                    "product_name VARCHAR(255), " +
+                    "entry_date VARCHAR(20) NOT NULL, " +
+                    "produced_quantity DOUBLE NOT NULL, " +
+                    "shift VARCHAR(50) NOT NULL, " +
+                    "remarks TEXT)");
 
-        // 3. Initial Daily Production Entries
-        // P1: Total Produced = 160 + 180 + 180 = 520 (Target 500 => Achieved, 104%)
-        addEntry(new ProductionEntry(null, p1.getId(), p1.getProductName(), yesterday, 160, "Morning", "Batch #A1 completed smoothly"));
-        addEntry(new ProductionEntry(null, p1.getId(), p1.getProductName(), yesterday, 180, "Evening", "Shift achieved 100% capacity"));
-        addEntry(new ProductionEntry(null, p1.getId(), p1.getProductName(), today, 180, "Morning", "Extra units produced"));
+            mysqlConnected = true;
+            System.out.println("✅ [MySQL] Connected successfully to production_db on localhost:3306");
+            syncCacheFromDatabase();
 
-        // P2: Total Produced = 120 + 130 = 250 (Target 300 => On Track, 83.3%)
-        addEntry(new ProductionEntry(null, p2.getId(), p2.getProductName(), yesterday, 120, "Morning", "Cylinder CNC Line 1"));
-        addEntry(new ProductionEntry(null, p2.getId(), p2.getProductName(), today, 130, "Morning", "Standard machining cycle"));
+        } catch (SQLException e) {
+            System.err.println("⚠️ [MySQL] Could not connect to MySQL: " + e.getMessage() + ". Using ConcurrentHashMap fallback.");
+            mysqlConnected = false;
+            seedFallbackData();
+        }
+    }
 
-        // P3: Total Produced = 80 + 90 = 170 (Target 400 => Lagging, 42.5%)
-        addEntry(new ProductionEntry(null, p3.getId(), p3.getProductName(), yesterday, 80, "Morning", "Minor tooling delay"));
-        addEntry(new ProductionEntry(null, p3.getId(), p3.getProductName(), today, 90, "Evening", "Lathe maintenance completed"));
+    /**
+     * Pre-populates the ConcurrentHashMap cache from MySQL tables.
+     */
+    private void syncCacheFromDatabase() {
+        if (!mysqlConnected) return;
 
-        // P4: Total Produced = 125 + 125 = 250 (Target 250 => Achieved, 100%)
-        addEntry(new ProductionEntry(null, p4.getId(), p4.getProductName(), yesterday, 125, "Morning", "Full assembly shift"));
-        addEntry(new ProductionEntry(null, p4.getId(), p4.getProductName(), today, 125, "Morning", "Final quality inspection passed"));
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {
+            // Load products into ConcurrentHashMap
+            try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM products");
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    Product p = new Product(
+                            rs.getLong("id"),
+                            rs.getString("product_code"),
+                            rs.getString("product_name"),
+                            rs.getString("category"),
+                            rs.getString("unit_of_measure"),
+                            rs.getString("description")
+                    );
+                    productCache.put(p.getId(), p);
+                }
+            }
+
+            // Load plans into ConcurrentHashMap
+            try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM production_plans");
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ProductionPlan plan = new ProductionPlan(
+                            rs.getLong("id"),
+                            rs.getLong("product_id"),
+                            rs.getString("product_name"),
+                            rs.getString("plan_month"),
+                            rs.getDouble("planned_quantity"),
+                            rs.getString("notes")
+                    );
+                    planCache.put(plan.getId(), plan);
+                }
+            }
+
+            // Load entries into ConcurrentHashMap
+            try (PreparedStatement ps = conn.prepareStatement("SELECT * FROM production_entries");
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ProductionEntry entry = new ProductionEntry(
+                            rs.getLong("id"),
+                            rs.getLong("product_id"),
+                            rs.getString("product_name"),
+                            rs.getString("entry_date"),
+                            rs.getDouble("produced_quantity"),
+                            rs.getString("shift"),
+                            rs.getString("remarks")
+                    );
+                    entryCache.put(entry.getId(), entry);
+                }
+            }
+
+            System.out.println("✅ [ConcurrentHashMap] Cache synchronized from MySQL: " + productCache.size() + " products.");
+
+        } catch (SQLException e) {
+            System.err.println("⚠️ Error syncing cache from MySQL: " + e.getMessage());
+        }
+    }
+
+    private void seedFallbackData() {
+        Product p1 = new Product(1L, "PRD-001", "Alloy Wheel 17-inch", "Casting", "Units", "Aluminum alloy wheels");
+        Product p2 = new Product(2L, "PRD-002", "Engine Cylinder Block", "Machining", "Units", "4-cylinder engine blocks");
+        productCache.put(p1.getId(), p1);
+        productCache.put(p2.getId(), p2);
     }
 
     // ================= PRODUCT METHODS =================
     public List<Product> getAllProducts() {
-        return new ArrayList<>(products);
+        if (mysqlConnected) {
+            List<Product> list = new ArrayList<>();
+            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                 PreparedStatement ps = conn.prepareStatement("SELECT * FROM products ORDER BY id ASC");
+                 ResultSet rs = ps.executeQuery()) {
+
+                while (rs.next()) {
+                    Product p = new Product(
+                            rs.getLong("id"),
+                            rs.getString("product_code"),
+                            rs.getString("product_name"),
+                            rs.getString("category"),
+                            rs.getString("unit_of_measure"),
+                            rs.getString("description")
+                    );
+                    list.add(p);
+                    productCache.put(p.getId(), p); // Update ConcurrentHashMap cache
+                }
+                return list;
+            } catch (SQLException e) {
+                System.err.println("MySQL Read Error: " + e.getMessage());
+            }
+        }
+        return new ArrayList<>(productCache.values());
     }
 
     public Optional<Product> getProductById(Long id) {
-        return products.stream().filter(p -> p.getId().equals(id)).findFirst();
+        // Fast O(1) read from ConcurrentHashMap cache
+        Product cached = productCache.get(id);
+        if (cached != null) return Optional.of(cached);
+
+        if (mysqlConnected) {
+            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                 PreparedStatement ps = conn.prepareStatement("SELECT * FROM products WHERE id = ?")) {
+                ps.setLong(1, id);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        Product p = new Product(
+                                rs.getLong("id"),
+                                rs.getString("product_code"),
+                                rs.getString("product_name"),
+                                rs.getString("category"),
+                                rs.getString("unit_of_measure"),
+                                rs.getString("description")
+                        );
+                        productCache.put(p.getId(), p);
+                        return Optional.of(p);
+                    }
+                }
+            } catch (SQLException e) {
+                System.err.println("Error reading product by ID: " + e.getMessage());
+            }
+        }
+        return Optional.empty();
     }
 
     public Product addProduct(Product product) {
-        if (product.getId() == null) {
-            product.setId(productIdSeq.getAndIncrement());
+        if (mysqlConnected) {
+            String sql = "INSERT INTO products (product_code, product_name, category, unit_of_measure, description) VALUES (?, ?, ?, ?, ?)";
+            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                 PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+
+                ps.setString(1, product.getProductCode());
+                ps.setString(2, product.getProductName());
+                ps.setString(3, product.getCategory());
+                ps.setString(4, product.getUnitOfMeasure());
+                ps.setString(5, product.getDescription());
+                ps.executeUpdate();
+
+                try (ResultSet keys = ps.getGeneratedKeys()) {
+                    if (keys.next()) {
+                        product.setId(keys.getLong(1));
+                    }
+                }
+            } catch (SQLException e) {
+                System.err.println("MySQL Insert Product Error: " + e.getMessage());
+                if (product.getId() == null) product.setId(fallbackIdSeq.getAndIncrement());
+            }
+        } else {
+            if (product.getId() == null) product.setId(fallbackIdSeq.getAndIncrement());
         }
-        products.add(product);
+
+        // Store into ConcurrentHashMap cache
+        productCache.put(product.getId(), product);
         return product;
     }
 
     public boolean deleteProduct(Long id) {
-        return products.removeIf(p -> p.getId().equals(id));
+        productCache.remove(id);
+        if (mysqlConnected) {
+            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                 PreparedStatement ps = conn.prepareStatement("DELETE FROM products WHERE id = ?")) {
+                ps.setLong(1, id);
+                return ps.executeUpdate() > 0;
+            } catch (SQLException e) {
+                System.err.println("MySQL Delete Product Error: " + e.getMessage());
+            }
+        }
+        return true;
     }
 
     // ================= PRODUCTION PLAN METHODS =================
     public List<ProductionPlan> getAllPlans() {
-        return new ArrayList<>(plans);
+        if (mysqlConnected) {
+            List<ProductionPlan> list = new ArrayList<>();
+            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                 PreparedStatement ps = conn.prepareStatement("SELECT * FROM production_plans ORDER BY id ASC");
+                 ResultSet rs = ps.executeQuery()) {
+
+                while (rs.next()) {
+                    ProductionPlan p = new ProductionPlan(
+                            rs.getLong("id"),
+                            rs.getLong("product_id"),
+                            rs.getString("product_name"),
+                            rs.getString("plan_month"),
+                            rs.getDouble("planned_quantity"),
+                            rs.getString("notes")
+                    );
+                    list.add(p);
+                    planCache.put(p.getId(), p);
+                }
+                return list;
+            } catch (SQLException e) {
+                System.err.println("MySQL Read Plans Error: " + e.getMessage());
+            }
+        }
+        return new ArrayList<>(planCache.values());
     }
 
     public ProductionPlan addPlan(ProductionPlan plan) {
-        if (plan.getId() == null) {
-            plan.setId(planIdSeq.getAndIncrement());
-        }
-        // Auto fill product name if absent
         if ((plan.getProductName() == null || plan.getProductName().isBlank()) && plan.getProductId() != null) {
             getProductById(plan.getProductId()).ifPresent(p -> plan.setProductName(p.getProductName()));
         }
-        plans.add(plan);
+
+        if (mysqlConnected) {
+            String sql = "INSERT INTO production_plans (product_id, product_name, plan_month, planned_quantity, notes) VALUES (?, ?, ?, ?, ?)";
+            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                 PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+
+                ps.setLong(1, plan.getProductId());
+                ps.setString(2, plan.getProductName());
+                ps.setString(3, plan.getPlanMonth());
+                ps.setDouble(4, plan.getPlannedQuantity());
+                ps.setString(5, plan.getNotes());
+                ps.executeUpdate();
+
+                try (ResultSet keys = ps.getGeneratedKeys()) {
+                    if (keys.next()) {
+                        plan.setId(keys.getLong(1));
+                    }
+                }
+            } catch (SQLException e) {
+                System.err.println("MySQL Insert Plan Error: " + e.getMessage());
+                if (plan.getId() == null) plan.setId(fallbackIdSeq.getAndIncrement());
+            }
+        } else {
+            if (plan.getId() == null) plan.setId(fallbackIdSeq.getAndIncrement());
+        }
+
+        planCache.put(plan.getId(), plan);
         return plan;
     }
 
     // ================= PRODUCTION ENTRY METHODS =================
     public List<ProductionEntry> getAllEntries() {
-        return new ArrayList<>(entries);
+        if (mysqlConnected) {
+            List<ProductionEntry> list = new ArrayList<>();
+            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                 PreparedStatement ps = conn.prepareStatement("SELECT * FROM production_entries ORDER BY id DESC");
+                 ResultSet rs = ps.executeQuery()) {
+
+                while (rs.next()) {
+                    ProductionEntry entry = new ProductionEntry(
+                            rs.getLong("id"),
+                            rs.getLong("product_id"),
+                            rs.getString("product_name"),
+                            rs.getString("entry_date"),
+                            rs.getDouble("produced_quantity"),
+                            rs.getString("shift"),
+                            rs.getString("remarks")
+                    );
+                    list.add(entry);
+                    entryCache.put(entry.getId(), entry);
+                }
+                return list;
+            } catch (SQLException e) {
+                System.err.println("MySQL Read Entries Error: " + e.getMessage());
+            }
+        }
+        return new ArrayList<>(entryCache.values());
     }
 
     public ProductionEntry addEntry(ProductionEntry entry) {
-        if (entry.getId() == null) {
-            entry.setId(entryIdSeq.getAndIncrement());
-        }
-        // Auto fill product name if absent
         if ((entry.getProductName() == null || entry.getProductName().isBlank()) && entry.getProductId() != null) {
             getProductById(entry.getProductId()).ifPresent(p -> entry.setProductName(p.getProductName()));
         }
-        entries.add(entry);
+
+        if (mysqlConnected) {
+            String sql = "INSERT INTO production_entries (product_id, product_name, entry_date, produced_quantity, shift, remarks) VALUES (?, ?, ?, ?, ?, ?)";
+            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                 PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+
+                ps.setLong(1, entry.getProductId());
+                ps.setString(2, entry.getProductName());
+                ps.setString(3, entry.getEntryDate());
+                ps.setDouble(4, entry.getProducedQuantity());
+                ps.setString(5, entry.getShift());
+                ps.setString(6, entry.getRemarks());
+                ps.executeUpdate();
+
+                try (ResultSet keys = ps.getGeneratedKeys()) {
+                    if (keys.next()) {
+                        entry.setId(keys.getLong(1));
+                    }
+                }
+            } catch (SQLException e) {
+                System.err.println("MySQL Insert Entry Error: " + e.getMessage());
+                if (entry.getId() == null) entry.setId(fallbackIdSeq.getAndIncrement());
+            }
+        } else {
+            if (entry.getId() == null) entry.setId(fallbackIdSeq.getAndIncrement());
+        }
+
+        entryCache.put(entry.getId(), entry);
         return entry;
     }
 
@@ -135,22 +391,26 @@ public class DataStore {
      * Computes Planned Quantity vs Produced Quantity, Difference, and Achievement %.
      */
     public List<VarianceReportItem> generateVarianceReport() {
+        List<Product> allProducts = getAllProducts();
+        List<ProductionPlan> allPlans = getAllPlans();
+        List<ProductionEntry> allEntries = getAllEntries();
+
         List<VarianceReportItem> report = new ArrayList<>();
 
-        for (Product product : products) {
+        for (Product product : allProducts) {
             // 1. Calculate total planned quantity for this product
-            double totalPlanned = plans.stream()
+            double totalPlanned = allPlans.stream()
                     .filter(p -> p.getProductId() != null && p.getProductId().equals(product.getId()))
                     .mapToDouble(ProductionPlan::getPlannedQuantity)
                     .sum();
 
             // 2. Calculate total actual quantity produced for this product
-            double totalProduced = entries.stream()
+            double totalProduced = allEntries.stream()
                     .filter(e -> e.getProductId() != null && e.getProductId().equals(product.getId()))
                     .mapToDouble(ProductionEntry::getProducedQuantity)
                     .sum();
 
-            // 3. Create Variance Item with mathematical difference and achievement %
+            // 3. Create Variance Item
             VarianceReportItem item = new VarianceReportItem(
                     product.getId(),
                     product.getProductCode(),
