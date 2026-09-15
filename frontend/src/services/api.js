@@ -5,10 +5,25 @@
 
 const BASE_URL = '/api';
 
+function getAuthToken() {
+  try {
+    const userStr = localStorage.getItem('user');
+    if (userStr) {
+      const user = JSON.parse(userStr);
+      return user.token;
+    }
+  } catch {}
+  return null;
+}
+
 async function request(endpoint, options = {}) {
+  const token = getAuthToken();
+  const authHeader = token ? { 'Authorization': `Bearer ${token}` } : {};
+
   const config = {
     headers: {
       'Content-Type': 'application/json',
+      ...authHeader,
       ...options.headers,
     },
     ...options,
